@@ -12,6 +12,9 @@
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
     "@guolao/vue-monaco-editor": "^1.6.0",
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "@vueuse/core": "^14.3.0",
     "element-plus": "^2.6.1",
     "markdown-it": "^14.2.0",
@@ -20,8 +23,7 @@
     "vue-i18n": "^9.14.5"
   },
   "devDependencies": {
-    "@tauri-apps/api": "^1.5.3",
-    "@tauri-apps/cli": "^1.5.11",
+    "@tauri-apps/cli": "^2.11.2",
     "@types/markdown-it": "^14.1.2",
     "@vitejs/plugin-vue": "^5.0.4",
     "typescript": "^5.4.2",

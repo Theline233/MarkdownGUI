@@ -15,7 +15,11 @@ use std::{
     },
     time::Duration,
 };
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
+};
 use tokio::sync::oneshot;
 
 fn engine_flags(
@@ -71,6 +75,7 @@ struct EngineManager {
 }
 
 struct EngineInner {
+    app_handle: Mutex<Option<AppHandle>>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<DocumentParseResult, String>>>>,
     state: Mutex<EngineState>,
@@ -78,7 +83,7 @@ struct EngineInner {
 }
 
 struct EngineState {
-    child: Option<tauri::api::process::CommandChild>,
+    child: Option<CommandChild>,
     ready: bool,
     queued: VecDeque<EngineQueuedRequest>,
     in_flight: HashMap<String, EngineQueuedRequest>,
@@ -131,6 +136,7 @@ impl EngineManager {
     fn new() -> Self {
         Self {
             inner: Arc::new(EngineInner {
+                app_handle: Mutex::new(None),
                 next_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 state: Mutex::new(EngineState {
@@ -144,7 +150,12 @@ impl EngineManager {
         }
     }
 
-    fn start(&self) {
+    fn set_app_handle(&self, app_handle: AppHandle) {
+        *self.inner.app_handle.lock().unwrap() = Some(app_handle);
+    }
+
+    fn start(&self, app_handle: AppHandle) {
+        self.set_app_handle(app_handle);
         if let Err(error) = self.restart() {
             eprintln!("[Engine Warn]: initial start failed: {}", error);
         }
@@ -265,28 +276,30 @@ impl EngineManager {
             let _ = child.kill();
         }
 
-        let spawn_result = match tauri::api::process::Command::new_sidecar("engine") {
-            Ok(command) => command.spawn().map_err(|e| {
-                format!(
-                    "Unable to start engine sidecar: {}. The development Python server will be used.",
-                    e
-                )
-            }),
-            Err(error) => Err(format!(
-                "Unable to initialize engine sidecar: {}. The development Python server will be used.",
-                error
-            )),
-        };
+        let app_handle = self
+            .inner
+            .app_handle
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "App handle is not available for engine startup".to_string())?;
+        let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/engine_server.py");
+        let spawn_result = app_handle
+            .shell()
+            .sidecar("engine-server")
+            .and_then(|command| command.spawn())
+            .map_err(|error| format!("Unable to start bundled engine sidecar: {}", error));
 
         let (mut rx, child) = match spawn_result {
             Ok(process) => process,
             Err(sidecar_error) => {
                 eprintln!("[Engine Warn]: {}", sidecar_error);
-                let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/engine_server.py");
-                tauri::api::process::Command::new("python")
+                app_handle
+                    .shell()
+                    .command("python")
                     .args([script_path])
                     .spawn()
-                    .map_err(|e| format!("Unable to start development Python engine server: {}", e))?
+                    .map_err(|error| format!("Unable to start development Python engine server: {}", error))?
             }
         };
 
@@ -300,18 +313,18 @@ impl EngineManager {
         tauri::async_runtime::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    tauri::api::process::CommandEvent::Stdout(line) => {
-                        manager.handle_stdout(line);
+                    CommandEvent::Stdout(line) => {
+                        manager.handle_stdout(String::from_utf8_lossy(&line).to_string());
                     }
-                    tauri::api::process::CommandEvent::Stderr(line) => {
-                        eprintln!("[Engine stderr]: {}", line);
+                    CommandEvent::Stderr(line) => {
+                        eprintln!("[Engine stderr]: {}", String::from_utf8_lossy(&line));
                     }
-                    tauri::api::process::CommandEvent::Terminated(payload) => {
+                    CommandEvent::Terminated(payload) => {
                         eprintln!("[Engine Warn]: process terminated: {:?}", payload.code);
                         manager.handle_exit();
                         return;
                     }
-                    tauri::api::process::CommandEvent::Error(error) => {
+                    CommandEvent::Error(error) => {
                         eprintln!("[Engine Warn]: process error: {}", error);
                         manager.handle_exit();
                         return;
@@ -654,9 +667,12 @@ fn main() {
     let startup_engine = engine_manager.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(engine_manager)
-        .setup(move |_app| {
-            startup_engine.start();
+        .setup(move |app| {
+            startup_engine.start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -22,7 +22,9 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile, UploadFiles } from 'element-plus'
-import { invoke } from '@tauri-apps/api/tauri'
+import { invoke } from '@tauri-apps/api/core'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { check } from '@tauri-apps/plugin-updater'
 import { useI18n } from 'vue-i18n'
 import { useDark, useDebounceFn, useStorage } from '@vueuse/core'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
@@ -818,10 +820,35 @@ const openSetting = (tab = 'ai') => {
   showSettings.value = true
 }
 
+const checkForUpdates = async () => {
+  try {
+    const update = await check()
+    if (!update) return
+
+    await ElMessageBox.confirm(
+      `检测到新版本 ${update.version}，是否立即下载并安装？`,
+      '发现新版本',
+      {
+        confirmButtonText: '立即更新',
+        cancelButtonText: '稍后',
+        type: 'info',
+      },
+    )
+
+    await update.downloadAndInstall()
+    await relaunch()
+  } catch {
+    // Update checks should never interrupt normal app usage.
+  }
+}
+
 onMounted(() => {
   preloadBundledEditorFonts()
   loadPersistedState()
   loadAiSettings()
+  window.setTimeout(() => {
+    void checkForUpdates()
+  }, 5000)
   document.addEventListener('pointerdown', handleGlobalPointerDown, true)
   document.addEventListener('contextmenu', handleGlobalContextMenu, true)
 })
