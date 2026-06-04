@@ -1,0 +1,4 @@
+src-tauri/target/
+src-tauri/__pycache__/
+dist/
+node_modules/
