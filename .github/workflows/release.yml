@@ -84,6 +84,30 @@ jobs:
             chmod +x $target
           }
 
+      - name: Create test input
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Content -Path test_input.txt -Value '{"id":"ci-smoke","file_path":"nonexistent.txt"}'
+
+      - name: Test engine-server
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/binaries/engine-server-${{ matrix.target }}${{ matrix.sidecarExt }}"
+          Write-Host "Testing: $exe"
+          $proc = Start-Process -FilePath $exe `
+            -RedirectStandardInput "test_input.txt" `
+            -RedirectStandardOutput "test_output.txt" `
+            -RedirectStandardError "test_error.txt" `
+            -NoNewWindow -PassThru
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $proc.Id -ErrorAction SilentlyContinue
+          Write-Host "=== STDOUT ==="
+          Get-Content test_output.txt -ErrorAction SilentlyContinue
+          Write-Host "=== STDERR ==="
+          Get-Content test_error.txt -ErrorAction SilentlyContinue
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
