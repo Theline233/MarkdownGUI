@@ -5,8 +5,26 @@ import traceback
 
 from markitdown import MarkItDown
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+# ── Force unbuffered stdout ──────────────────────────────────────────
+# PyInstaller --onefile wraps stdout in a way that can suppress flushes
+# even with flush=True.  This wrapper makes every write() call flush
+# immediately, which is critical for the JSON-line protocol on stdout.
+class _UnbufferedStream:
+    def __init__(self, stream):
+        self.stream = stream
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+    def flush(self):
+        self.stream.flush()
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+sys.stdout = _UnbufferedStream(sys.stdout)
+# ──────────────────────────────────────────────────────────────────────
+
+if hasattr(sys.stdout.stream, "reconfigure"):
+    sys.stdout.stream.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
@@ -220,11 +238,17 @@ def build_excel_result(
 
 
 def read_excel_rows(file_path, request_id=None):
+    emit_progress(request_id, 12, "加载依赖")
     import pandas as pd
     from openpyxl import load_workbook
 
     emit_progress(request_id, 15, "读取文件")
-    workbook = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+    except Exception as exc:
+        emit_progress(request_id, 15, f"加载失败: {exc}")
+        raise
+
     emit_progress(request_id, 30, "读取文件")
 
     try:
