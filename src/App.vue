@@ -967,6 +967,21 @@ const checkForUpdates = async () => {
 
     updateInfo.value = { version: update.version, update }
     updateState.value = 'available'
+
+    try {
+      await ElMessageBox.confirm(
+        t('app.updateContent') + ' ' + update.version,
+        t('app.updateTitle'),
+        {
+          confirmButtonText: t('app.updateConfirm'),
+          cancelButtonText: t('app.updateCancel'),
+          type: 'info',
+        },
+      )
+      await startUpdateDownload()
+    } catch {
+      // User cancelled — badge button remains visible for manual trigger
+    }
   } catch {
     // Update checks should never interrupt normal app usage.
   }
@@ -978,6 +993,7 @@ const startUpdateDownload = async () => {
   try {
     updateState.value = 'downloading'
     updateProgress.value = 0
+    ElMessage.info(t('app.updateDownloadingMsg'))
 
     await updateInfo.value.update.download((event: { event: string; data: { contentLength?: number; totalDownloaded: number } }) => {
       if (event.event === 'Progress') {
@@ -991,10 +1007,12 @@ const startUpdateDownload = async () => {
     })
 
     updateState.value = 'installing'
+    ElMessage.success(t('app.updateInstallingMsg'))
     await updateInfo.value.update.install()
     await relaunch()
   } catch {
     updateState.value = 'available'
+    ElMessage.error(t('app.updateFailed'))
   }
 }
 
