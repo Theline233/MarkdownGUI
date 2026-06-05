@@ -3,7 +3,20 @@ import os
 import sys
 import traceback
 
-from markitdown import MarkItDown
+# markitdown is imported lazily (only for non-Excel files) so that
+# PyInstaller does NOT try to collect its heavy dependency tree when
+# bundling the engine-server sidecar.
+_markitdown = None
+
+
+def _get_markitdown():
+    global _markitdown
+    if _markitdown is None:
+        from markitdown import MarkItDown
+
+        _markitdown = MarkItDown()
+    return _markitdown
+
 
 # ── Force unbuffered stdout ──────────────────────────────────────────
 # PyInstaller --onefile wraps stdout in a way that can suppress flushes
@@ -292,7 +305,7 @@ def repair_excel_to_markdown(file_path, header_row_index, skip_rows, request_id=
     )
 
 
-def handle_request(markitdown, request):
+def handle_request(request):
     request_id = request.get("id")
     if not request_id:
         raise ValueError("missing request id")
@@ -328,7 +341,7 @@ def handle_request(markitdown, request):
         }
 
     emit_progress(request_id, 30, "读取文件")
-    result = markitdown.convert(file_path)
+    result = _get_markitdown().convert(file_path)
     emit_progress(request_id, 90, "生成 Markdown")
     return {
         "id": request_id,
@@ -338,7 +351,6 @@ def handle_request(markitdown, request):
 
 
 def main():
-    markitdown = MarkItDown()
     write_stdout({"type": "ready"})
 
     for raw_line in sys.stdin:
@@ -350,7 +362,7 @@ def main():
         try:
             request = json.loads(line)
             request_id = request.get("id")
-            write_stdout(handle_request(markitdown, request))
+            write_stdout(handle_request(request))
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
             write_stdout({
