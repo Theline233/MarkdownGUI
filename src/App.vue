@@ -31,6 +31,7 @@ import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import { Splitpanes, Pane } from 'splitpanes'
 import 'splitpanes/dist/splitpanes.css'
 import MarkdownIt from 'markdown-it'
+import JSZip from 'jszip'
 import ClockThemeToggle from './components/ClockThemeToggle.vue'
 import SettingsModal from './components/SettingsModal.vue'
 
@@ -45,6 +46,7 @@ const isDark = useDark()
 
 type FileType = 'pdf' | 'xlsx' | 'docx'
 type FileStatus = 'done' | 'processing'
+type ExportFormat = 'markdown' | 'html' | 'json'
 
 interface HistoryFile {
   id: number
@@ -238,6 +240,9 @@ const selectedLang = ref(String(locale.value))
 const markdownContents = ref<Record<number, string>>({})
 const chatHistories = ref<Record<number, ChatMessage[]>>({})
 const deletedFileIds = new Set<number>()
+const isBatchExportMode = ref(false)
+const selectedBatchFileIds = ref<number[]>([])
+const batchExportFormat = ref<ExportFormat>('markdown')
 const fileListRef = ref<HTMLElement | null>(null)
 const contextMenu = ref<ContextMenuState>({
   visible: false,
@@ -258,10 +263,8 @@ const updateSlider = async (fileId: number) => {
   const item = listEl.querySelector(`[data-file-id="${fileId}"]`) as HTMLElement | null
   if (!item) return
 
-  const listRect = listEl.getBoundingClientRect()
-  const itemRect = item.getBoundingClientRect()
-  const newTop = itemRect.top - listRect.top
-  const newHeight = itemRect.height
+  const newTop = item.offsetTop
+  const newHeight = item.offsetHeight
   const oldTop = parseFloat(sliderStyle.value.top || '0')
   const oldHeight = parseFloat(sliderStyle.value.height || '0')
 
@@ -500,7 +503,11 @@ const fileToBase64 = (file: File): Promise<string> => {
 
 const hasTauriIpcBridge = (): boolean =>
   typeof window !== 'undefined'
-  && typeof (window as Window & { __TAURI_IPC__?: unknown }).__TAURI_IPC__ === 'function'
+  && (
+    typeof (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ !== 'undefined'
+    || typeof (window as Window & { __TAURI__?: unknown }).__TAURI__ !== 'undefined'
+    || typeof (window as Window & { __TAURI_IPC__?: unknown }).__TAURI_IPC__ === 'function'
+  )
 
 const invokeTauriCommand = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
   if (!hasTauriIpcBridge()) {
@@ -590,6 +597,56 @@ const closeContextMenu = () => {
   }
 }
 
+const handleFileItemClick = (file: HistoryFile) => {
+  if (isBatchExportMode.value) {
+    toggleBatchFileSelection(file, !selectedBatchFileIds.value.includes(file.id))
+    return
+  }
+  selectFile(file)
+}
+
+const handleFileItemContextMenu = (file: HistoryFile, event: MouseEvent) => {
+  if (isBatchExportMode.value) return
+  openFileContextMenu(file, event)
+}
+
+const enterBatchExportMode = () => {
+  closeContextMenu()
+  isBatchExportMode.value = true
+  selectedBatchFileIds.value = []
+  batchExportFormat.value = 'markdown'
+}
+
+const exitBatchExportMode = () => {
+  isBatchExportMode.value = false
+  selectedBatchFileIds.value = []
+  batchExportFormat.value = 'markdown'
+}
+
+const handleMainAreaClick = () => {
+  if (isBatchExportMode.value) {
+    exitBatchExportMode()
+  }
+}
+
+const toggleBatchFileSelection = (file: HistoryFile, checked: boolean) => {
+  if (file.status !== 'done') return
+
+  const selectedIds = new Set(selectedBatchFileIds.value)
+  if (checked) {
+    selectedIds.add(file.id)
+  } else {
+    selectedIds.delete(file.id)
+  }
+  selectedBatchFileIds.value = Array.from(selectedIds)
+}
+
+const handleBatchCheckboxChange = (file: HistoryFile, checked: string | number | boolean) => {
+  toggleBatchFileSelection(file, Boolean(checked))
+}
+
+const selectedBatchCount = computed(() => selectedBatchFileIds.value.length)
+
 const handleGlobalPointerDown = (event: PointerEvent) => {
   const target = event.target
   if (!(target instanceof Element)) return
@@ -670,6 +727,7 @@ const deleteFile = (id: number) => {
   closeContextMenu()
   deletedFileIds.add(id)
   historyFiles.value = historyFiles.value.filter((file) => file.id !== id)
+  selectedBatchFileIds.value = selectedBatchFileIds.value.filter((fileId) => fileId !== id)
 
   const nextContents = { ...markdownContents.value }
   delete nextContents[id]
@@ -710,6 +768,7 @@ const clearAllHistory = async () => {
     historyFiles.value = []
     markdownContents.value = {}
     chatHistories.value = {}
+    exitBatchExportMode()
     selectedId.value = null
     sliderStyle.value = {
       top: '0px',
@@ -986,37 +1045,71 @@ const openDataDialog = () => {
   dialogVisible.value = true
 }
 
-const handleExport = (command: string) => {
-  if (!currentMarkdown.value) {
-    ElMessage.warning(t('app.noExportData'))
-    return
-  }
+const exportFormatExtensions: Record<ExportFormat, string> = {
+  markdown: 'md',
+  html: 'html',
+  json: 'json',
+}
 
-  switch (command) {
-    case 'markdown':
-      exportMarkdown()
-      break
-    case 'html':
-      exportHTML()
-      break
-    case 'json':
-      exportJSON()
-      break
-    case 'csv':
-      exportCSV()
-      break
-    default:
-      ElMessage.warning(t('app.noExportData'))
+const exportFormatMimeTypes: Record<ExportFormat, string> = {
+  markdown: 'text/markdown;charset=utf-8;',
+  html: 'text/html;charset=utf-8;',
+  json: 'application/json;charset=utf-8;',
+}
+
+const escapeHtmlText = (text: string): string =>
+  text.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char] ?? char))
+
+const getExportBaseFileName = (file?: HistoryFile | null): string => {
+  const sourceName = file?.name ?? 'document'
+  return sourceName.replace(/\.[^/.]+$/, '') || 'document'
+}
+
+const renderMarkdownContent = (markdown: string): string =>
+  md.render(cleanMarkdownTable(markdown))
+
+const buildHtmlDocument = (fileName: string, markdown: string): string => `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>${escapeHtmlText(fileName)}</title>
+  <style>
+    body { margin: 24px; color: #2c3550; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .markdown-body { width: 100%; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f6f8fc; text-align: left; }
+  </style>
+</head>
+<body>
+  <div class="markdown-body">${renderMarkdownContent(markdown)}</div>
+</body>
+</html>`
+
+const buildExportArtifact = (file: HistoryFile, format: ExportFormat) => {
+  const markdown = markdownContents.value[file.id] ?? ''
+  const baseName = getExportBaseFileName(file)
+  const extension = exportFormatExtensions[format]
+  const content = {
+    markdown,
+    html: buildHtmlDocument(baseName, markdown),
+    json: JSON.stringify(parseMarkdownTableToJson(markdown), null, 2),
+  }[format]
+
+  return {
+    content,
+    type: exportFormatMimeTypes[format],
+    fileName: `${baseName}.${extension}`,
   }
 }
 
-const exportBaseFileName = computed(() => {
-  const sourceName = selectedFile.value?.name ?? 'document'
-  return sourceName.replace(/\.[^/.]+$/, '') || 'document'
-})
-
-const downloadBlob = (content: string, type: string, fileName: string) => {
-  const blob = new Blob([content], { type })
+const triggerBlobDownload = (blob: Blob, fileName: string) => {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
 
@@ -1029,42 +1122,101 @@ const downloadBlob = (content: string, type: string, fileName: string) => {
   URL.revokeObjectURL(url)
 }
 
-const exportMarkdown = () => {
-  downloadBlob(
-    currentMarkdown.value ?? '',
-    'text/markdown;charset=utf-8;',
-    `${exportBaseFileName.value}.md`,
-  )
+const downloadBlob = (content: string, type: string, fileName: string) => {
+  triggerBlobDownload(new Blob([content], { type }), fileName)
+}
 
-  ElMessage.success(t('app.exportedMarkdown'))
+const exportFile = (file: HistoryFile, format: ExportFormat): boolean => {
+  if (!markdownContents.value[file.id]) {
+    ElMessage.warning(t('app.noExportData'))
+    return false
+  }
+
+  const artifact = buildExportArtifact(file, format)
+  downloadBlob(artifact.content, artifact.type, artifact.fileName)
+
+  if (format === 'markdown') {
+    ElMessage.success(t('app.exportedMarkdown'))
+  } else if (format === 'html') {
+    ElMessage.success(t('app.exportedHtml'))
+  } else {
+    ElMessage.success(t('app.exportedJson'))
+  }
+
+  return true
+}
+
+const handleExport = (command: string) => {
+  if (command !== 'markdown' && command !== 'html' && command !== 'json' && command !== 'csv') {
+    ElMessage.warning(t('app.noExportData'))
+    return
+  }
+
+  const file = selectedFile.value
+  if (!file || !currentMarkdown.value) {
+    ElMessage.warning(t('app.noExportData'))
+    return
+  }
+
+  if (command === 'csv') {
+    exportCSV()
+  } else if (command === 'markdown') {
+    exportMarkdown()
+  } else if (command === 'html') {
+    exportHTML()
+  } else {
+    exportJSON()
+  }
+}
+
+const handleBatchExport = async () => {
+  if (selectedBatchFileIds.value.length === 0) {
+    ElMessage.warning(t('app.batchNoSelected'))
+    return
+  }
+
+  const selectedIds = new Set(selectedBatchFileIds.value)
+  const selectedFiles = historyFiles.value.filter((file) => selectedIds.has(file.id) && file.status === 'done')
+
+  if (selectedFiles.length === 0) {
+    ElMessage.warning(t('app.batchNoSelected'))
+    return
+  }
+
+  if (selectedFiles.length === 1) {
+    if (exportFile(selectedFiles[0], batchExportFormat.value)) {
+      exitBatchExportMode()
+    }
+    return
+  }
+
+  const zip = new JSZip()
+  selectedFiles.forEach((file) => {
+    const artifact = buildExportArtifact(file, batchExportFormat.value)
+    zip.file(artifact.fileName, artifact.content)
+  })
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  const timestamp = formatLocalIsoDateTime(new Date())
+    .replace(/[-:]/g, '')
+    .replace('T', '_')
+  triggerBlobDownload(blob, `MarkdownGUI_export_${timestamp}.zip`)
+  exitBatchExportMode()
+}
+
+const exportMarkdown = () => {
+  const file = selectedFile.value
+  if (file) exportFile(file, 'markdown')
 }
 
 const exportHTML = () => {
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>${exportBaseFileName.value}</title>
-  <style>
-    body { margin: 24px; color: #2c3550; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    .markdown-body { width: 100%; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; }
-    th { background: #f6f8fc; text-align: left; }
-  </style>
-</head>
-<body>
-  <div class="markdown-body">${renderedHtml.value}</div>
-</body>
-</html>`
-
-  downloadBlob(html, 'text/html;charset=utf-8;', `${exportBaseFileName.value}.html`)
-  ElMessage.success(t('app.exportedHtml'))
+  const file = selectedFile.value
+  if (file) exportFile(file, 'html')
 }
 
 const exportJSON = () => {
-  downloadBlob(jsonOutput.value, 'application/json;charset=utf-8;', `${exportBaseFileName.value}.json`)
-  ElMessage.success(t('app.exportedJson'))
+  const file = selectedFile.value
+  if (file) exportFile(file, 'json')
 }
 
 const exportCSV = () => {
@@ -1405,7 +1557,18 @@ const sendMessage = async () => {
       <div class="sidebar-list">
         <div class="list-header">
           <div class="list-title">{{ t('app.fileHistory') }}</div>
-          <el-tooltip :content="t('app.clearHistory')" placement="right">
+          <div class="list-actions">
+            <el-button
+              v-if="!isBatchExportMode"
+              class="batch-export-entry"
+              :icon="Download"
+              type="primary"
+              link
+              @click.stop="enterBatchExportMode"
+            >
+              {{ t('app.batchExport') }}
+            </el-button>
+            <span v-else class="batch-mode-label">{{ t('app.batchExportMode') }}</span>
             <el-button
               class="clear-history-btn"
               :icon="Delete"
@@ -1413,7 +1576,7 @@ const sendMessage = async () => {
               link
               @click.stop="clearAllHistory"
             />
-          </el-tooltip>
+          </div>
         </div>
         <ul ref="fileListRef" class="file-list">
           <div class="highlight-slider" :style="sliderStyle"></div>
@@ -1422,10 +1585,23 @@ const sendMessage = async () => {
             :key="file.id"
             :data-file-id="file.id"
             class="file-item"
-            :class="{ active: file.id === selectedId, pinned: file.pinned }"
-            @click="selectFile(file)"
-            @contextmenu.prevent.stop="openFileContextMenu(file, $event)"
+            :class="{
+              active: file.id === selectedId,
+              pinned: file.pinned,
+              'batch-mode': isBatchExportMode,
+              'batch-disabled': isBatchExportMode && file.status !== 'done',
+            }"
+            @click="handleFileItemClick(file)"
+            @contextmenu.prevent.stop="handleFileItemContextMenu(file, $event)"
           >
+            <el-checkbox
+              v-if="isBatchExportMode"
+              class="batch-checkbox"
+              :model-value="selectedBatchFileIds.includes(file.id)"
+              :disabled="file.status !== 'done'"
+              @click.stop
+              @change="handleBatchCheckboxChange(file, $event)"
+            />
             <el-icon class="file-icon" :style="{ color: typeIconColor[file.type] }">
               <Tickets v-if="file.type === 'xlsx'" />
               <Files v-else-if="file.type === 'docx'" />
@@ -1440,6 +1616,7 @@ const sendMessage = async () => {
               {{ file.status === 'done' ? t('app.statusDone') : t('app.statusProcessing') }}
             </span>
             <el-button
+              v-if="!isBatchExportMode"
               class="delete-item-btn"
               :icon="Delete"
               type="danger"
@@ -1448,6 +1625,27 @@ const sendMessage = async () => {
             />
           </li>
         </ul>
+
+        <Transition name="batch-export">
+          <div v-if="isBatchExportMode" class="batch-export-bar" @click.stop>
+            <div class="batch-export-row">
+              <span class="batch-count">{{ t('app.batchSelected', { count: selectedBatchCount }) }}</span>
+              <el-select v-model="batchExportFormat" class="batch-format-select" size="small">
+                <el-option label="Markdown" value="markdown" />
+                <el-option label="HTML" value="html" />
+                <el-option label="JSON" value="json" />
+              </el-select>
+            </div>
+            <div class="batch-export-actions">
+              <el-button type="primary" :icon="Download" @click="handleBatchExport">
+                {{ t('app.batchExportBtn') }}
+              </el-button>
+              <el-button @click="exitBatchExportMode">
+                {{ t('app.batchCancel') }}
+              </el-button>
+            </div>
+          </div>
+        </Transition>
       </div>
 
       <div class="sidebar-footer">
@@ -1489,7 +1687,7 @@ const sendMessage = async () => {
       </div>
     </el-aside>
 
-    <el-container class="main-wrap">
+    <el-container class="main-wrap" @click="handleMainAreaClick">
       <el-header class="toolbar">
         <div class="toolbar-actions">
           <ClockThemeToggle class="custom-clock-toggle" />
@@ -1727,10 +1925,11 @@ const sendMessage = async () => {
 
 .sidebar-list {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
 }
 
 .sidebar-footer {
@@ -1861,7 +2060,9 @@ const sendMessage = async () => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-height: 28px;
   padding: 0 2px 0 6px;
+  flex-shrink: 0;
 }
 
 .list-title {
@@ -1870,6 +2071,37 @@ const sendMessage = async () => {
   color: var(--text-secondary);
   letter-spacing: 1px;
   text-transform: uppercase;
+}
+
+.list-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  width: 126px;
+  min-width: 126px;
+  height: 28px;
+}
+
+.batch-export-entry {
+  width: 88px;
+  height: 26px !important;
+  padding: 0 4px !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  justify-content: center;
+}
+
+.batch-mode-label {
+  width: 88px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #409eff;
+  white-space: nowrap;
 }
 
 .clear-history-btn {
@@ -1892,6 +2124,10 @@ const sendMessage = async () => {
   flex-direction: column;
   gap: 4px;
   position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .highlight-slider {
@@ -1917,6 +2153,16 @@ const sendMessage = async () => {
   z-index: 1;
 }
 
+.file-item.batch-mode {
+  cursor: pointer;
+  padding-right: 12px;
+}
+
+.file-item.batch-disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
 .file-item:hover {
   background: var(--btn-hover);
 }
@@ -1938,6 +2184,11 @@ const sendMessage = async () => {
 .file-icon {
   font-size: 18px;
   flex-shrink: 0;
+}
+
+.batch-checkbox {
+  flex-shrink: 0;
+  height: 18px;
 }
 
 .file-name {
@@ -1984,6 +2235,68 @@ const sendMessage = async () => {
 
 .file-item:hover .delete-item-btn {
   opacity: 1;
+}
+
+.batch-export-bar {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-card);
+  box-shadow: 0 8px 20px rgba(31, 45, 73, 0.08);
+}
+
+.batch-export-enter-active,
+.batch-export-leave-active {
+  transition:
+    transform 0.25s ease,
+    opacity 0.25s ease;
+}
+
+.batch-export-enter-from,
+.batch-export-leave-to {
+  opacity: 0;
+  transform: translateY(100%);
+}
+
+.batch-export-enter-to,
+.batch-export-leave-from {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.batch-export-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.batch-count {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.batch-format-select {
+  width: 118px;
+  flex-shrink: 0;
+}
+
+.batch-export-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.batch-export-actions :deep(.el-button) {
+  min-width: 0;
+  margin-left: 0;
 }
 
 .file-context-menu {
