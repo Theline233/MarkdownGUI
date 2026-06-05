@@ -7,6 +7,7 @@ import {
   Files,
   Download,
   ArrowDown,
+  ArrowUp,
   Grid,
   MagicStick,
   Loading,
@@ -23,6 +24,7 @@ import {
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile, UploadFiles } from 'element-plus'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
 import { useI18n } from 'vue-i18n'
@@ -74,6 +76,17 @@ interface DocumentParseResult {
   confidence?: number | null
   meta?: Record<string, unknown> | null
   tempFilePath?: string | null
+}
+
+interface ParseProgressPayload {
+  id: string
+  percent: number
+  stage: string
+}
+
+interface ParseProgressState {
+  percent: number
+  stage: string
 }
 
 interface AiRepairDecision {
@@ -238,6 +251,7 @@ const safeMigrateAiSettings = () => {
 safeMigrateAiSettings()
 const selectedLang = ref(String(locale.value))
 const markdownContents = ref<Record<number, string>>({})
+const parseProgressByFile = ref<Record<number, ParseProgressState>>({})
 const chatHistories = ref<Record<number, ChatMessage[]>>({})
 const deletedFileIds = new Set<number>()
 const isBatchExportMode = ref(false)
@@ -255,6 +269,7 @@ const sliderStyle = ref<Record<string, string>>({
   height: '0px',
   opacity: '0',
 })
+let unlistenParseProgress: (() => void) | null = null
 
 const updateSlider = async (fileId: number) => {
   await nextTick()
@@ -343,6 +358,63 @@ const monacoEditorOptions = computed(() => ({
 }))
 
 const currentSelectedFile = computed(() => historyFiles.value.find((file) => file.id === selectedId.value) ?? null)
+
+const normalizeProgressPercent = (percent: number): number => {
+  if (!Number.isFinite(percent)) return 10
+  return Math.max(0, Math.min(100, Math.round(percent)))
+}
+
+const getDefaultParseProgress = (): ParseProgressState => ({
+  percent: 10,
+  stage: '读取文件',
+})
+
+const currentParseProgress = computed(() => {
+  const fileId = currentSelectedFile.value?.id
+  if (fileId === undefined) return getDefaultParseProgress()
+  return parseProgressByFile.value[fileId] ?? getDefaultParseProgress()
+})
+
+const currentParseProgressStyle = computed(() => ({
+  width: `${currentParseProgress.value.percent}%`,
+}))
+
+const getLocalizedParseStage = (stage: string): string => {
+  const normalizedStage = stage.trim()
+  if (normalizedStage === '收到请求' || normalizedStage === '读取文件') {
+    return t('app.stageReading')
+  }
+  if (normalizedStage === '清洗数据') {
+    return t('app.stageCleaning')
+  }
+  if (normalizedStage === '生成 Markdown') {
+    return t('app.stageGenerating')
+  }
+  return normalizedStage || t('app.stageReading')
+}
+
+const updateParseProgress = (fileId: number, percent: number, stage: string) => {
+  if (!historyFiles.value.some((file) => file.id === fileId)) return
+  parseProgressByFile.value = {
+    ...parseProgressByFile.value,
+    [fileId]: {
+      percent: normalizeProgressPercent(percent),
+      stage: stage || '读取文件',
+    },
+  }
+}
+
+const clearParseProgress = (fileId: number) => {
+  if (!(fileId in parseProgressByFile.value)) return
+  const { [fileId]: _removed, ...nextProgress } = parseProgressByFile.value
+  parseProgressByFile.value = nextProgress
+}
+
+const handleParseProgress = (payload: ParseProgressPayload) => {
+  const fileId = Number(payload.id)
+  if (!Number.isFinite(fileId)) return
+  updateParseProgress(fileId, payload.percent, payload.stage)
+}
 
 const currentMessages = computed(() =>
   selectedId.value !== null ? (chatHistories.value[selectedId.value] || []) : [],
@@ -726,6 +798,7 @@ const renameFile = async (id: number) => {
 const deleteFile = (id: number) => {
   closeContextMenu()
   deletedFileIds.add(id)
+  clearParseProgress(id)
   historyFiles.value = historyFiles.value.filter((file) => file.id !== id)
   selectedBatchFileIds.value = selectedBatchFileIds.value.filter((fileId) => fileId !== id)
 
@@ -767,6 +840,7 @@ const clearAllHistory = async () => {
     historyFiles.value.forEach((file) => deletedFileIds.add(file.id))
     historyFiles.value = []
     markdownContents.value = {}
+    parseProgressByFile.value = {}
     chatHistories.value = {}
     exitBatchExportMode()
     selectedId.value = null
@@ -879,23 +953,48 @@ const openSetting = (tab = 'ai') => {
   showSettings.value = true
 }
 
+const updateInfo = ref<{
+  version: string
+  update: any
+} | null>(null)
+const updateProgress = ref(0)
+const updateState = ref<'idle' | 'available' | 'downloading' | 'installing'>('idle')
+
 const checkForUpdates = async () => {
   try {
     const update = await check()
     if (!update) return
 
-    await ElMessageBox.confirm(
-      `${t('app.updateContent')}\n${update.version}`,
-      t('app.updateTitle'),
-      {
-        type: 'info',
-      },
-    )
-
-    await update.downloadAndInstall()
-    await relaunch()
+    updateInfo.value = { version: update.version, update }
+    updateState.value = 'available'
   } catch {
     // Update checks should never interrupt normal app usage.
+  }
+}
+
+const startUpdateDownload = async () => {
+  if (!updateInfo.value || updateState.value !== 'available') return
+
+  try {
+    updateState.value = 'downloading'
+    updateProgress.value = 0
+
+    await updateInfo.value.update.download((event: { event: string; data: { contentLength?: number; totalDownloaded: number } }) => {
+      if (event.event === 'Progress') {
+        const total = event.data.contentLength || 0
+        if (total > 0) {
+          updateProgress.value = Math.round(
+            (event.data.totalDownloaded / total) * 100,
+          )
+        }
+      }
+    })
+
+    updateState.value = 'installing'
+    await updateInfo.value.update.install()
+    await relaunch()
+  } catch {
+    updateState.value = 'available'
   }
 }
 
@@ -903,6 +1002,13 @@ onMounted(() => {
   preloadBundledEditorFonts()
   loadPersistedState()
   loadAiSettings()
+  listen<ParseProgressPayload>('parse-progress', (event) => {
+    handleParseProgress(event.payload)
+  })
+    .then((unlisten) => {
+      unlistenParseProgress = unlisten
+    })
+    .catch(() => {})
   window.setTimeout(() => {
     void checkForUpdates()
   }, 5000)
@@ -911,6 +1017,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  unlistenParseProgress?.()
+  unlistenParseProgress = null
   document.removeEventListener('pointerdown', handleGlobalPointerDown, true)
   document.removeEventListener('contextmenu', handleGlobalContextMenu, true)
 })
@@ -999,6 +1107,7 @@ const handleChange = async (file: UploadFile, _files: UploadFiles) => {
   sortHistoryFiles()
 
   markdownContents.value[newFile.id] = ''
+  updateParseProgress(newFile.id, 10, '读取文件')
   selectedId.value = newFile.id
   updateSlider(newFile.id)
 
@@ -1015,6 +1124,7 @@ const handleChange = async (file: UploadFile, _files: UploadFiles) => {
       enableOcr: settings.value.enableOcr,
       specTolerance: settings.value.specTolerance,
       flattenHeaders: settings.value.flattenHeaders,
+      requestId: String(newFile.id),
     })
     let parseResult = normalizeParseResult(rawResult)
     const tempFilePath = parseResult.tempFilePath
@@ -1030,12 +1140,15 @@ const handleChange = async (file: UploadFile, _files: UploadFiles) => {
     markdownContents.value[newFile.id] = markdown
     selectedId.value = newFile.id
     updateSlider(newFile.id)
+    updateParseProgress(newFile.id, 100, '生成 Markdown')
     updateFileStatus(newFile.id, 'done')
+    clearParseProgress(newFile.id)
     void pushParsedResultToWebhook(newFile.name, markdown)
     ElMessage.success(`「${newFile.name}」${t('app.parseComplete')}`)
   } catch (error) {
     if (deletedFileIds.has(newFile.id)) return
     updateFileStatus(newFile.id, 'done')
+    clearParseProgress(newFile.id)
     const message = error instanceof Error ? error.message : String(error)
     ElMessage.error(`${t('app.parseFailed')}: ${message}`)
   }
@@ -1731,6 +1844,29 @@ const sendMessage = async () => {
           </el-dropdown>
           <el-button class="tool-btn" :icon="Grid" plain @click="openDataDialog">{{ $t('toolbar.extractTableData') }}</el-button>
           <el-button class="tool-btn ai-btn" :icon="MagicStick" @click.stop="openAssistant">{{ t('app.aiAnalysis') }}</el-button>
+          <el-button
+            v-if="updateState === 'available' && updateInfo"
+            class="tool-btn update-badge"
+            :icon="ArrowUp"
+            @click="startUpdateDownload"
+          >
+            {{ t('app.updateAvailable') }} {{ updateInfo.version }}
+          </el-button>
+          <el-button
+            v-if="updateState === 'downloading'"
+            class="tool-btn update-progress"
+            disabled
+          >
+            <span class="update-progress-bar" :style="{ width: updateProgress + '%' }" />
+            <span class="update-progress-text">{{ t('app.updateDownloading') }} {{ updateProgress }}%</span>
+          </el-button>
+          <el-button
+            v-if="updateState === 'installing'"
+            class="tool-btn update-progress"
+            disabled
+          >
+            {{ t('app.updateInstalling') }}...
+          </el-button>
         </div>
       </el-header>
 
@@ -1740,8 +1876,15 @@ const sendMessage = async () => {
         </div>
 
         <div v-else-if="currentSelectedFile?.status === 'processing'" class="converting-mask">
-          <el-icon class="converting-icon is-spin"><Loading /></el-icon>
-          <p class="converting-text">{{ t('app.parsing') }}…</p>
+          <div class="parse-progress-panel">
+            <div class="parse-progress-track" role="progressbar" :aria-valuenow="currentParseProgress.percent" aria-valuemin="0" aria-valuemax="100">
+              <div class="parse-progress-fill" :style="currentParseProgressStyle"></div>
+            </div>
+            <div class="parse-progress-meta">
+              <span class="parse-progress-stage">{{ getLocalizedParseStage(currentParseProgress.stage) }}...</span>
+              <span class="parse-progress-percent">{{ currentParseProgress.percent }}%</span>
+            </div>
+          </div>
         </div>
 
         <template v-else-if="currentMarkdown !== null">
@@ -2540,6 +2683,94 @@ const sendMessage = async () => {
   box-shadow: var(--ai-btn-hover-shadow) !important;
 }
 
+.update-badge {
+  height: 36px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background: #e8f0fe !important;
+  border: 1px solid #90baf5 !important;
+  color: #1a6de0 !important;
+  font-weight: 600 !important;
+  border-radius: 10px !important;
+  min-width: 140px;
+  padding: 0 16px !important;
+  cursor: pointer !important;
+  transition: all 0.25s ease !important;
+  animation: update-badge-pulse 2s ease-in-out infinite;
+}
+
+.update-badge:hover {
+  background: #d4e4fc !important;
+  border-color: #5b9cf5 !important;
+  transform: translateY(-1px);
+}
+
+.update-badge :deep(.el-icon) {
+  font-size: 16px;
+  margin-right: 6px;
+  color: #1a6de0;
+}
+
+.update-progress {
+  height: 36px !important;
+  min-width: 140px;
+  padding: 0 !important;
+  border-radius: 10px !important;
+  border: 1px solid #90baf5 !important;
+  background: #e8f0fe !important;
+  position: relative;
+  overflow: hidden;
+  cursor: default !important;
+}
+
+.update-progress-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: linear-gradient(135deg, #409eff, #66b1ff);
+  border-radius: 9px 0 0 9px;
+  transition: width 0.3s ease;
+  z-index: 0;
+}
+
+.update-progress-text {
+  position: relative;
+  z-index: 1;
+  color: #3a4866;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+:global(html.dark) .update-badge {
+  background: #1a2d4a !important;
+  border-color: #2a5da8 !important;
+  color: #7bb8ff !important;
+}
+
+:global(html.dark) .update-badge :deep(.el-icon) {
+  color: #7bb8ff;
+}
+
+:global(html.dark) .update-badge:hover {
+  background: #1f3660 !important;
+}
+
+:global(html.dark) .update-progress {
+  background: #1a2d4a !important;
+  border-color: #2a5da8 !important;
+}
+
+:global(html.dark) .update-progress-text {
+  color: #c8daf5;
+}
+
+@keyframes update-badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(64, 158, 255, 0); }
+}
+
 :global(html.dark) .ai-btn:hover {
   background: var(--ai-btn-hover-bg) !important;
   border-color: var(--ai-btn-hover-border) !important;
@@ -2578,18 +2809,57 @@ const sendMessage = async () => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 18px;
+  padding: 24px;
 }
 
-.converting-icon {
-  font-size: 48px;
-  color: #409eff;
+.parse-progress-panel {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.converting-text {
-  font-size: 15px;
+.parse-progress-track {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(64, 158, 255, 0.12);
+}
+
+.parse-progress-fill {
+  height: 100%;
+  min-width: 8px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #409eff 0%, #67c23a 100%);
+  box-shadow: 0 0 16px rgba(64, 158, 255, 0.24);
+  transition: width 0.3s ease;
+}
+
+.parse-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 22px;
+}
+
+.parse-progress-stage {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
   color: var(--text-secondary);
-  letter-spacing: 1px;
+}
+
+.parse-progress-percent {
+  flex-shrink: 0;
+  min-width: 42px;
+  text-align: right;
+  font-size: 13px;
+  font-weight: 700;
+  color: #409eff;
 }
 
 .is-spin {

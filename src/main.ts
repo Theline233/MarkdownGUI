@@ -14,3 +14,5 @@ for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
 app.use(ElementPlus)
 app.use(i18n)
 app.mount('#app')
+
+if ((window as any).__hideSplash) (window as any).__hideSplash()

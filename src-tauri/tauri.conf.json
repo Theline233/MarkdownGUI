@@ -22,7 +22,8 @@
         "minWidth": 1024,
         "center": true,
         "title": "MarkdownGUI",
-        "resizable": true
+        "resizable": true,
+        "backgroundColor": "#ffffff"
       }
     ]
   },

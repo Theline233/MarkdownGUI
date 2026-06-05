@@ -19,6 +19,17 @@ def write_error(message):
     print(message, file=sys.stderr, flush=True)
 
 
+def emit_progress(request_id, percent, stage):
+    if not request_id:
+        return
+    write_stdout({
+        "type": "progress",
+        "id": str(request_id),
+        "percent": percent,
+        "stage": stage,
+    })
+
+
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 
 
@@ -103,6 +114,7 @@ def build_excel_result(
     header_row_index=None,
     skip_rows=None,
     confidence_override=None,
+    request_id=None,
 ):
     total_rows = len(selected_raw_rows)
     skip_row_set = set(skip_rows or [])
@@ -117,6 +129,7 @@ def build_excel_result(
         }
         if selected_sheet:
             meta["sheet_name"] = selected_sheet
+        emit_progress(request_id, 90, "生成 Markdown")
         return {
             "markdown": "",
             "confidence": 0.0 if confidence_override is None else confidence_override,
@@ -178,6 +191,7 @@ def build_excel_result(
 
     dataframe = pd.DataFrame(filtered_data_rows, columns=filtered_header)
     markdown = dataframe_to_markdown(dataframe)
+    emit_progress(request_id, 90, "生成 Markdown")
     confidence = confidence_override
     if confidence is None:
         confidence = calculate_confidence(
@@ -205,11 +219,12 @@ def build_excel_result(
     }
 
 
-def read_excel_rows(file_path):
+def read_excel_rows(file_path, request_id=None):
     import pandas as pd
     from openpyxl import load_workbook
 
     workbook = load_workbook(file_path, read_only=True, data_only=True)
+    emit_progress(request_id, 30, "读取文件")
 
     try:
         selected_sheet = None
@@ -232,21 +247,23 @@ def read_excel_rows(file_path):
                 selected_non_empty_rows = non_empty_rows
                 break
 
+        emit_progress(request_id, 60, "清洗数据")
         return selected_sheet, selected_raw_rows, selected_non_empty_rows
     finally:
         workbook.close()
 
 
-def convert_excel_to_markdown(file_path):
-    return build_excel_result(*read_excel_rows(file_path))
+def convert_excel_to_markdown(file_path, request_id=None):
+    return build_excel_result(*read_excel_rows(file_path, request_id), request_id=request_id)
 
 
-def repair_excel_to_markdown(file_path, header_row_index, skip_rows):
+def repair_excel_to_markdown(file_path, header_row_index, skip_rows, request_id=None):
     return build_excel_result(
-        *read_excel_rows(file_path),
+        *read_excel_rows(file_path, request_id),
         header_row_index=header_row_index,
         skip_rows=skip_rows,
         confidence_override=1.0,
+        request_id=request_id,
     )
 
 
@@ -259,6 +276,8 @@ def handle_request(markitdown, request):
     if not file_path:
         raise ValueError("missing file_path")
 
+    emit_progress(request_id, 10, "收到请求")
+
     if request.get("mode") == "repair":
         if not is_excel_file(file_path):
             raise ValueError("repair mode only supports Excel files")
@@ -268,7 +287,7 @@ def handle_request(markitdown, request):
         skip_rows = request.get("skip_rows") or []
         if not isinstance(skip_rows, list) or not all(isinstance(index, int) for index in skip_rows):
             raise ValueError("repair mode requires skip_rows as an integer array")
-        result = repair_excel_to_markdown(file_path, header_row_index, skip_rows)
+        result = repair_excel_to_markdown(file_path, header_row_index, skip_rows, request_id)
         return {
             "id": request_id,
             "ok": True,
@@ -276,14 +295,16 @@ def handle_request(markitdown, request):
         }
 
     if is_excel_file(file_path):
-        result = convert_excel_to_markdown(file_path)
+        result = convert_excel_to_markdown(file_path, request_id)
         return {
             "id": request_id,
             "ok": True,
             **result,
         }
 
+    emit_progress(request_id, 30, "读取文件")
     result = markitdown.convert(file_path)
+    emit_progress(request_id, 90, "生成 Markdown")
     return {
         "id": request_id,
         "ok": True,

@@ -6,22 +6,24 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(debug_assertions)]
+use std::process::Command as StdCommand;
 use std::{
     collections::{HashMap, VecDeque},
-    process::Command as StdCommand,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
 use tokio::sync::oneshot;
 
+#[cfg(debug_assertions)]
 fn engine_flags(
     strict_align: bool,
     enable_ocr: bool,
@@ -44,6 +46,7 @@ fn engine_flags(
     ]
 }
 
+#[cfg(debug_assertions)]
 fn run_python_engine(
     file_path: &str,
     strict_align: bool,
@@ -77,6 +80,7 @@ struct EngineManager {
 struct EngineInner {
     app_handle: Mutex<Option<AppHandle>>,
     next_id: AtomicU64,
+    process_generation: AtomicU64,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<DocumentParseResult, String>>>>,
     state: Mutex<EngineState>,
     restarting: Mutex<bool>,
@@ -84,6 +88,7 @@ struct EngineInner {
 
 struct EngineState {
     child: Option<CommandChild>,
+    active_generation: u64,
     ready: bool,
     queued: VecDeque<EngineQueuedRequest>,
     in_flight: HashMap<String, EngineQueuedRequest>,
@@ -122,6 +127,14 @@ struct DocumentParseResult {
     temp_file_path: Option<String>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParseProgress {
+    id: String,
+    percent: u8,
+    stage: String,
+}
+
 #[derive(Deserialize)]
 struct EngineResponse {
     id: String,
@@ -138,9 +151,11 @@ impl EngineManager {
             inner: Arc::new(EngineInner {
                 app_handle: Mutex::new(None),
                 next_id: AtomicU64::new(1),
+                process_generation: AtomicU64::new(0),
                 pending: Mutex::new(HashMap::new()),
                 state: Mutex::new(EngineState {
                     child: None,
+                    active_generation: 0,
                     ready: false,
                     queued: VecDeque::new(),
                     in_flight: HashMap::new(),
@@ -161,6 +176,14 @@ impl EngineManager {
         }
     }
 
+    fn next_request_id(&self) -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     async fn request(
         &self,
         file_path: &str,
@@ -169,11 +192,29 @@ impl EngineManager {
         spec_tolerance: bool,
         flatten_headers: bool,
     ) -> Result<DocumentParseResult, String> {
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        );
+        self.request_with_id(
+            None,
+            file_path,
+            strict_align,
+            enable_ocr,
+            spec_tolerance,
+            flatten_headers,
+        )
+        .await
+    }
+
+    async fn request_with_id(
+        &self,
+        request_id: Option<String>,
+        file_path: &str,
+        strict_align: bool,
+        enable_ocr: bool,
+        spec_tolerance: bool,
+        flatten_headers: bool,
+    ) -> Result<DocumentParseResult, String> {
+        let id = request_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| self.next_request_id());
         self.request_engine(EngineRequest {
             id,
             file_path: file_path.to_string(),
@@ -190,15 +231,14 @@ impl EngineManager {
 
     async fn request_repair(
         &self,
+        request_id: Option<String>,
         file_path: &str,
         header_row_index: usize,
         skip_rows: Vec<usize>,
     ) -> Result<DocumentParseResult, String> {
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = request_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| self.next_request_id());
         self.request_engine(EngineRequest {
             id,
             file_path: file_path.to_string(),
@@ -214,6 +254,10 @@ impl EngineManager {
     }
 
     async fn request_engine(&self, request: EngineRequest) -> Result<DocumentParseResult, String> {
+        if !self.is_running_or_starting() {
+            return Err("Engine sidecar is not running".to_string());
+        }
+
         let id = request.id.clone();
         let payload = serde_json::to_string(&request)
             .map_err(|e| format!("Unable to encode engine request: {}", e))?;
@@ -226,7 +270,6 @@ impl EngineManager {
             payload,
             attempts: 0,
         });
-        self.ensure_started();
 
         match tokio::time::timeout(Duration::from_secs(300), rx).await {
             Ok(Ok(result)) => result,
@@ -238,17 +281,10 @@ impl EngineManager {
         }
     }
 
-    fn ensure_started(&self) {
-        let should_start = {
-            let state = self.inner.state.lock().unwrap();
-            state.child.is_none()
-        };
-
-        if should_start {
-            if let Err(error) = self.restart() {
-                eprintln!("[Engine Warn]: restart failed: {}", error);
-            }
-        }
+    fn is_running_or_starting(&self) -> bool {
+        let has_child = self.inner.state.lock().unwrap().child.is_some();
+        let restarting = *self.inner.restarting.lock().unwrap();
+        has_child || restarting
     }
 
     fn restart(&self) -> Result<(), String> {
@@ -266,14 +302,40 @@ impl EngineManager {
     }
 
     fn start_process(&self) -> Result<(), String> {
+        let generation = self
+            .inner
+            .process_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let mut failed_ids = Vec::new();
         let old_child = {
             let mut state = self.inner.state.lock().unwrap();
             state.ready = false;
+            state.active_generation = generation;
+
+            let in_flight = std::mem::take(&mut state.in_flight);
+            for (_, mut request) in in_flight {
+                request.attempts += 1;
+                if request.attempts <= 1 {
+                    state.queued.push_front(request);
+                } else {
+                    failed_ids.push(request.id);
+                }
+            }
+
             state.child.take()
         };
 
         if let Some(child) = old_child {
             let _ = child.kill();
+        }
+
+        for id in failed_ids {
+            if let Some(sender) = self.inner.pending.lock().unwrap().remove(&id) {
+                let _ = sender.send(Err(
+                    "Engine process restarted while handling request".to_string()
+                ));
+            }
         }
 
         let app_handle = self
@@ -283,7 +345,6 @@ impl EngineManager {
             .unwrap()
             .clone()
             .ok_or_else(|| "App handle is not available for engine startup".to_string())?;
-        let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/engine_server.py");
         let spawn_result = app_handle
             .shell()
             .sidecar("engine-server")
@@ -293,19 +354,37 @@ impl EngineManager {
         let (mut rx, child) = match spawn_result {
             Ok(process) => process,
             Err(sidecar_error) => {
-                eprintln!("[Engine Warn]: {}", sidecar_error);
-                app_handle
-                    .shell()
-                    .command("python")
-                    .args([script_path])
-                    .spawn()
-                    .map_err(|error| format!("Unable to start development Python engine server: {}", error))?
+                #[cfg(not(debug_assertions))]
+                {
+                    self.fail_queued_requests(&sidecar_error);
+                    return Err(sidecar_error);
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/engine_server.py");
+                    eprintln!("[Engine Warn]: {}", sidecar_error);
+                    app_handle
+                        .shell()
+                        .command("python")
+                        .args([script_path])
+                        .spawn()
+                        .map_err(|error| {
+                            let message = format!(
+                                "Unable to start development Python engine server: {}",
+                                error
+                            );
+                            self.fail_queued_requests(&message);
+                            message
+                        })?
+                }
             }
         };
 
         {
             let mut state = self.inner.state.lock().unwrap();
             state.child = Some(child);
+            state.active_generation = generation;
             state.ready = false;
         }
 
@@ -314,26 +393,27 @@ impl EngineManager {
             while let Some(event) = rx.recv().await {
                 match event {
                     CommandEvent::Stdout(line) => {
-                        manager.handle_stdout(String::from_utf8_lossy(&line).to_string());
+                        manager
+                            .handle_stdout(generation, String::from_utf8_lossy(&line).to_string());
                     }
                     CommandEvent::Stderr(line) => {
                         eprintln!("[Engine stderr]: {}", String::from_utf8_lossy(&line));
                     }
                     CommandEvent::Terminated(payload) => {
                         eprintln!("[Engine Warn]: process terminated: {:?}", payload.code);
-                        manager.handle_exit();
+                        manager.handle_exit(generation);
                         return;
                     }
                     CommandEvent::Error(error) => {
                         eprintln!("[Engine Warn]: process error: {}", error);
-                        manager.handle_exit();
+                        manager.handle_exit(generation);
                         return;
                     }
                     _ => {}
                 }
             }
 
-            manager.handle_exit();
+            manager.handle_exit(generation);
         });
 
         Ok(())
@@ -370,12 +450,19 @@ impl EngineManager {
 
         if needs_restart {
             if let Err(error) = self.restart() {
-                eprintln!("[Engine Warn]: restart after write failure failed: {}", error);
+                eprintln!(
+                    "[Engine Warn]: restart after write failure failed: {}",
+                    error
+                );
             }
         }
     }
 
-    fn handle_stdout(&self, raw_line: String) {
+    fn handle_stdout(&self, generation: u64, raw_line: String) {
+        if !self.is_current_generation(generation) {
+            return;
+        }
+
         let line = raw_line.trim_end_matches(['\r', '\n']).trim();
         if line.is_empty() {
             return;
@@ -384,7 +471,10 @@ impl EngineManager {
         let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("[Engine Warn]: invalid stdout JSON: {}; line={}", error, line);
+                eprintln!(
+                    "[Engine Warn]: invalid stdout JSON: {}; line={}",
+                    error, line
+                );
                 return;
             }
         };
@@ -392,9 +482,24 @@ impl EngineManager {
         if value.get("type").and_then(Value::as_str) == Some("ready") {
             {
                 let mut state = self.inner.state.lock().unwrap();
+                if state.active_generation != generation {
+                    return;
+                }
                 state.ready = true;
             }
             self.flush_queue();
+            return;
+        }
+
+        if value.get("type").and_then(Value::as_str) == Some("progress") {
+            let progress = match serde_json::from_value::<ParseProgress>(value) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    eprintln!("[Engine Warn]: invalid progress payload: {}", error);
+                    return;
+                }
+            };
+            self.emit_progress(progress);
             return;
         }
 
@@ -408,11 +513,19 @@ impl EngineManager {
 
         {
             let mut state = self.inner.state.lock().unwrap();
+            if state.active_generation != generation {
+                return;
+            }
             state.in_flight.remove(&response.id);
         }
 
         if let Some(sender) = self.inner.pending.lock().unwrap().remove(&response.id) {
             let result = if response.ok {
+                self.emit_progress(ParseProgress {
+                    id: response.id.clone(),
+                    percent: 100,
+                    stage: "生成 Markdown".to_string(),
+                });
                 Ok(DocumentParseResult {
                     markdown: response.markdown.unwrap_or_default(),
                     confidence: response.confidence,
@@ -449,7 +562,10 @@ impl EngineManager {
                             !state.queued.is_empty()
                         }
                         Err(error) => {
-                            eprintln!("[Engine Warn]: stdin write failed while flushing: {}", error);
+                            eprintln!(
+                                "[Engine Warn]: stdin write failed while flushing: {}",
+                                error
+                            );
                             state.ready = false;
                             state.queued.push_front(request);
                             needs_restart = true;
@@ -477,11 +593,15 @@ impl EngineManager {
         }
     }
 
-    fn handle_exit(&self) {
+    fn handle_exit(&self, generation: u64) {
         let mut failed_ids = Vec::new();
 
         {
             let mut state = self.inner.state.lock().unwrap();
+            if state.active_generation != generation {
+                return;
+            }
+
             state.ready = false;
             state.child = None;
 
@@ -498,7 +618,9 @@ impl EngineManager {
 
         for id in failed_ids {
             if let Some(sender) = self.inner.pending.lock().unwrap().remove(&id) {
-                let _ = sender.send(Err("Engine process exited while handling request".to_string()));
+                let _ = sender.send(Err(
+                    "Engine process exited while handling request".to_string()
+                ));
             }
         }
 
@@ -506,20 +628,67 @@ impl EngineManager {
             eprintln!("[Engine Warn]: automatic restart failed: {}", error);
         }
     }
+
+    fn is_current_generation(&self, generation: u64) -> bool {
+        self.inner.state.lock().unwrap().active_generation == generation
+    }
+
+    fn emit_progress(&self, progress: ParseProgress) {
+        let app_handle = self.inner.app_handle.lock().unwrap().clone();
+        if let Some(app_handle) = app_handle {
+            if let Err(error) = app_handle.emit("parse-progress", progress) {
+                eprintln!("[Engine Warn]: failed to emit parse progress: {}", error);
+            }
+        }
+    }
+
+    fn fail_queued_requests(&self, message: &str) {
+        let failed_ids = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.ready = false;
+            state.child = None;
+
+            let mut ids = Vec::new();
+            ids.extend(state.queued.drain(..).map(|request| request.id));
+            ids.extend(state.in_flight.drain().map(|(id, _)| id));
+            ids
+        };
+
+        for id in failed_ids {
+            if let Some(sender) = self.inner.pending.lock().unwrap().remove(&id) {
+                let _ = sender.send(Err(message.to_string()));
+            }
+        }
+    }
 }
 
 #[tauri::command]
-async fn convert_document(file_path: String, engine: State<'_, EngineManager>) -> Result<String, String> {
+async fn convert_document(
+    file_path: String,
+    engine: State<'_, EngineManager>,
+) -> Result<String, String> {
     engine
         .request(&file_path, true, false, false, false)
         .await
         .map(|result| result.markdown)
         .or_else(|error| {
-            eprintln!("[Engine Warn]: persistent engine failed, using one-shot fallback: {}", error);
-            run_python_engine(&file_path, true, false, false, false)
+            #[cfg(not(debug_assertions))]
+            {
+                Err(error)
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "[Engine Warn]: persistent engine failed, using one-shot fallback: {}",
+                    error
+                );
+                run_python_engine(&file_path, true, false, false, false)
+            }
         })
 }
 
+#[cfg(debug_assertions)]
 fn fallback_parse_result(markdown: String) -> DocumentParseResult {
     DocumentParseResult {
         markdown,
@@ -560,8 +729,7 @@ fn cleanup_temp_path(file_path: &str) -> Result<(), String> {
         return Err("Refusing to remove file outside temp dir".to_string());
     }
 
-    std::fs::remove_file(canonical_path)
-        .map_err(|e| format!("Unable to remove temp file: {}", e))
+    std::fs::remove_file(canonical_path).map_err(|e| format!("Unable to remove temp file: {}", e))
 }
 
 #[tauri::command]
@@ -574,10 +742,11 @@ async fn repair_document(
     file_path: String,
     header_row_index: usize,
     skip_rows: Vec<usize>,
+    request_id: Option<String>,
     engine: State<'_, EngineManager>,
 ) -> Result<DocumentParseResult, String> {
     engine
-        .request_repair(&file_path, header_row_index, skip_rows)
+        .request_repair(request_id, &file_path, header_row_index, skip_rows)
         .await
 }
 
@@ -589,6 +758,7 @@ async fn convert_document_bytes(
     enable_ocr: bool,
     spec_tolerance: bool,
     flatten_headers: bool,
+    request_id: Option<String>,
     engine: State<'_, EngineManager>,
 ) -> Result<DocumentParseResult, String> {
     let bytes = base64::engine::general_purpose::STANDARD
@@ -600,7 +770,8 @@ async fn convert_document_bytes(
 
     let temp_path_string = temp_path.to_string_lossy().to_string();
     let mut result = engine
-        .request(
+        .request_with_id(
+            request_id,
             &temp_path_string,
             strict_align,
             enable_ocr,
@@ -609,15 +780,26 @@ async fn convert_document_bytes(
         )
         .await
         .or_else(|error| {
-            eprintln!("[Engine Warn]: persistent engine failed, using one-shot fallback: {}", error);
-            run_python_engine(
-                &temp_path_string,
-                strict_align,
-                enable_ocr,
-                spec_tolerance,
-                flatten_headers,
-            )
-            .map(fallback_parse_result)
+            #[cfg(not(debug_assertions))]
+            {
+                Err(error)
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "[Engine Warn]: persistent engine failed, using one-shot fallback: {}",
+                    error
+                );
+                run_python_engine(
+                    &temp_path_string,
+                    strict_align,
+                    enable_ocr,
+                    spec_tolerance,
+                    flatten_headers,
+                )
+                .map(fallback_parse_result)
+            }
         });
 
     if let Ok(parse_result) = result.as_mut() {
@@ -651,14 +833,25 @@ async fn process_document(
         .await
         .map(|result| result.markdown)
         .or_else(|error| {
-            eprintln!("[Engine Warn]: persistent engine failed, using one-shot fallback: {}", error);
-            run_python_engine(
-                &file_path,
-                strict_align,
-                enable_ocr,
-                spec_tolerance,
-                flatten_headers,
-            )
+            #[cfg(not(debug_assertions))]
+            {
+                Err(error)
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "[Engine Warn]: persistent engine failed, using one-shot fallback: {}",
+                    error
+                );
+                run_python_engine(
+                    &file_path,
+                    strict_align,
+                    enable_ocr,
+                    spec_tolerance,
+                    flatten_headers,
+                )
+            }
         })
 }
 
