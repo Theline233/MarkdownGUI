@@ -3,5 +3,10 @@
     "externalBin": [
       "binaries/engine-server"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "untrusted comment: minisign public key\ndW50cnVzdGVkIGNvbW1lbnQ6IGlpbmlzaWduIHB1YmxpYyBrZXk6IEYzODg1ODZERTRBOTl0M0EKUldRNkpLbmtiVmlJODBuSDIvdklLY1pnUndELytmby9HRHZNcmJ6TUt4WEs5TWtZd3dadVdwNSsK"
+    }
   }
 }
