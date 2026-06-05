@@ -865,7 +865,11 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(engine_manager)
         .setup(move |app| {
-            startup_engine.start(app.handle().clone());
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                startup_engine.start(app_handle);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
