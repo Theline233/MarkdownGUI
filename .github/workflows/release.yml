@@ -108,6 +108,10 @@ jobs:
           Write-Host "=== STDERR ==="
           Get-Content test_error.txt -ErrorAction SilentlyContinue
 
+      - name: Install create-dmg
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
