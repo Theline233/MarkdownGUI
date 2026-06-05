@@ -1,6 +1,6 @@
 {
   "name": "markdowngui",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A cross-platform desktop application built with Tauri + Vue 3 + Vite + TypeScript",
   "type": "module",
   "scripts": {
