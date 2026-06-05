@@ -137,6 +137,10 @@ const messages = {
       detectTimeout: '模型检测超时',
       settingsSaved: '配置已保存',
       geminiManualHint: 'Gemini 请手动填写模型名',
+      checkUpdate: '检查更新',
+      checkingUpdate: '检查中...',
+      alreadyLatest: '当前已是最新版本',
+      checkUpdateFailed: '检查更新失败',
     },
   },
   'en-US': {
@@ -273,6 +277,10 @@ const messages = {
       detectTimeout: 'Model detection timed out',
       settingsSaved: 'Settings saved',
       geminiManualHint: 'For Gemini, please enter the model name manually',
+      checkUpdate: 'Check for Updates',
+      checkingUpdate: 'Checking...',
+      alreadyLatest: 'You are on the latest version',
+      checkUpdateFailed: 'Failed to check for updates',
     },
   },
 }

@@ -162,6 +162,15 @@
               <span>{{ t('settingsModal.autoSave') }}</span>
               <el-switch v-model="settings.autoSave" />
             </div>
+            <div v-if="isTauriRuntime" class="form-group update-group">
+              <el-button
+                class="mac-btn"
+                :loading="checkingUpdate"
+                @click="checkForUpdatesManually"
+              >
+                {{ checkingUpdate ? t('settingsModal.checkingUpdate') : t('settingsModal.checkUpdate') }}
+              </el-button>
+            </div>
           </div>
         </div>
 
@@ -177,7 +186,9 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { check } from '@tauri-apps/plugin-updater'
 import { Connection, Cpu, Operation, Setting } from '@element-plus/icons-vue'
 
 interface AppSettingsState {
@@ -224,6 +235,11 @@ const providerOptions = computed(() => [
 
 const modelOptions = ref<string[]>([])
 const detectingModels = ref(false)
+const checkingUpdate = ref(false)
+const isTauriRuntime = computed(() =>
+  typeof window !== 'undefined'
+  && typeof (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ !== 'undefined',
+)
 const defaultApiKeys: Record<string, string> = {
   deepseek: '',
   openai: '',
@@ -448,6 +464,37 @@ const detectAvailableModels = async () => {
   }
 }
 
+const checkForUpdatesManually = async () => {
+  checkingUpdate.value = true
+
+  try {
+    const update = await check()
+    if (!update) {
+      ElMessage.success(t('settingsModal.alreadyLatest'))
+      return
+    }
+
+    try {
+      await ElMessageBox.confirm(
+        `${t('app.updateContent')}\n${update.version}`,
+        t('app.updateTitle'),
+        {
+          type: 'info',
+        },
+      )
+    } catch {
+      return
+    }
+
+    await update.downloadAndInstall()
+    await relaunch()
+  } catch {
+    ElMessage.error(t('settingsModal.checkUpdateFailed'))
+  } finally {
+    checkingUpdate.value = false
+  }
+}
+
 const saveSettings = () => {
   const nextSettings = createSettingsDraft(settings.value)
   config.value = nextSettings
@@ -596,6 +643,12 @@ const saveSettings = () => {
   font-size: 14px;
   font-weight: 500;
   color: var(--text-primary);
+}
+
+.update-group {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: 4px;
 }
 
 .content-footer {
