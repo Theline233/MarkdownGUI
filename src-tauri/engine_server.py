@@ -223,6 +223,7 @@ def read_excel_rows(file_path, request_id=None):
     import pandas as pd
     from openpyxl import load_workbook
 
+    emit_progress(request_id, 15, "读取文件")
     workbook = load_workbook(file_path, read_only=True, data_only=True)
     emit_progress(request_id, 30, "读取文件")
 
