@@ -68,6 +68,30 @@ def is_excel_file(file_path):
     return os.path.splitext(file_path)[1].lower() in EXCEL_EXTENSIONS
 
 
+DOCX_EXTENSIONS = {".docx"}
+
+
+def is_docx_file(file_path):
+    return os.path.splitext(file_path)[1].lower() in DOCX_EXTENSIONS
+
+
+def convert_docx_to_markdown(file_path, request_id=None):
+    emit_progress(request_id, 15, "读取文档")
+    import docx
+
+    doc = docx.Document(file_path)
+    emit_progress(request_id, 30, "读取文档")
+
+    lines = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            lines.append(text)
+
+    emit_progress(request_id, 90, "生成 Markdown")
+    return "\n\n".join(lines)
+
+
 def clean_cell(value):
     if value is None:
         return ""
@@ -338,6 +362,14 @@ def handle_request(request):
             "id": request_id,
             "ok": True,
             **result,
+        }
+
+    if is_docx_file(file_path):
+        markdown = convert_docx_to_markdown(file_path, request_id)
+        return {
+            "id": request_id,
+            "ok": True,
+            "markdown": markdown,
         }
 
     emit_progress(request_id, 30, "读取文件")

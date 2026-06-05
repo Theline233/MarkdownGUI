@@ -1,3 +1,4 @@
 markitdown
 openpyxl
 pandas
+python-docx
