@@ -1876,7 +1876,9 @@ const sendMessage = async () => {
             disabled
           >
             <span class="update-progress-bar" :style="{ width: updateProgress + '%' }" />
-            <span class="update-progress-text">{{ t('app.updateDownloading') }} {{ updateProgress }}%</span>
+            <span class="update-progress-text">
+              {{ updateProgress > 0 ? t('app.updateProgress', { percent: updateProgress }) : t('app.updateDownloading') + '...' }}
+            </span>
           </el-button>
           <el-button
             v-if="updateState === 'installing'"
