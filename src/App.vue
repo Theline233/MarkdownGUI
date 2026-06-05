@@ -826,11 +826,9 @@ const checkForUpdates = async () => {
     if (!update) return
 
     await ElMessageBox.confirm(
-      `检测到新版本 ${update.version}，是否立即下载并安装？`,
-      '发现新版本',
+      `${t('app.updateContent')}\n${update.version}`,
+      t('app.updateTitle'),
       {
-        confirmButtonText: '立即更新',
-        cancelButtonText: '稍后',
         type: 'info',
       },
     )

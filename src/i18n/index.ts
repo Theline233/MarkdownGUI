@@ -81,6 +81,8 @@ const messages = {
       pinFile: '置顶',
       renameFile: '重命名文件',
       deleteFile: '删除',
+      updateTitle: '发现新版本',
+      updateContent: '是否立即下载并重启应用？',
     },
     settingsModal: {
       settingsTitle: '配置中心',
@@ -209,6 +211,8 @@ const messages = {
       pinFile: 'Pin',
       renameFile: 'Rename File',
       deleteFile: 'Delete',
+      updateTitle: 'New Version Available',
+      updateContent: 'Would you like to download and restart now?',
     },
     settingsModal: {
       settingsTitle: 'Settings Center',
